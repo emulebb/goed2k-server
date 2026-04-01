@@ -443,7 +443,8 @@ func (s *Server) dispatch(client *clientSession, packet byte, body []byte) error
 	case opSearchRequest:
 		query, err := ParseSearchRequest(body)
 		if err != nil {
-			return err
+			s.logger.Warn("invalid search request", "remote", client.conn.RemoteAddr().String(), "err", err)
+			return s.handleSearch(client, SearchQuery{Root: searchMatchNoneExpr{}})
 		}
 		return s.handleSearch(client, query)
 	case opSearchMore:

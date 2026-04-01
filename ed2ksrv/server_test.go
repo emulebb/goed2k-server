@@ -121,6 +121,30 @@ func TestParseSearchRequestMatchesGoed2KEncoding(t *testing.T) {
 	}
 }
 
+func TestParseSearchRequestSupportsRecursivePrefixBooleanTree(t *testing.T) {
+	query, err := ParseSearchRequest(prefixSearchBool(searchBoolOr,
+		prefixSearchString("ubuntu"),
+		prefixSearchTaggedString(protocol.FTFileType, "Audio"),
+	))
+	if err != nil {
+		t.Fatalf("parse recursive prefix search: %v", err)
+	}
+
+	ubuntu := FileRecord{Name: "ubuntu-24.04-desktop-amd64.iso", FileType: "Iso", Extension: "iso", Size: 6144000000, Sources: 12, CompleteSources: 10}
+	audio := FileRecord{Name: "demo-track.flac", FileType: "Audio", Extension: "flac", Size: 52428800, Sources: 3, CompleteSources: 2}
+	other := FileRecord{Name: "archlinux-2026.03.01-x86_64.iso", FileType: "Iso", Extension: "iso", Size: 1024000000, Sources: 6, CompleteSources: 6}
+
+	if !matchesRecord(ubuntu, query) {
+		t.Fatalf("expected ubuntu record to match recursive OR query")
+	}
+	if !matchesRecord(audio, query) {
+		t.Fatalf("expected audio record to match recursive OR query")
+	}
+	if matchesRecord(other, query) {
+		t.Fatalf("did not expect unrelated record to match recursive OR query")
+	}
+}
+
 func TestServerHandshakeSearchAndSources(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CatalogPath = filepath.Join("..", "testdata", "catalog.json")
@@ -345,6 +369,220 @@ func TestOfferFilesRegistersDynamicSharedEntries(t *testing.T) {
 	sources, ok := packet.(*serverproto.FoundFileSources)
 	if !ok || len(sources.Sources) != 1 || sources.Sources[0].Port() != 4662 {
 		t.Fatalf("unexpected offered sources packet: %T %+v", packet, sources)
+	}
+}
+
+func TestServerSearchSupportsRecursivePrefixBooleanQueries(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CatalogPath = filepath.Join("..", "testdata", "catalog.json")
+	cfg.SearchBatchSize = 10
+	cfg.Message = "prefix-search"
+	cfg.AdminListenAddress = ""
+
+	catalog, err := LoadCatalog(cfg.CatalogPath)
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	server, err := NewServer(cfg, catalog, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() { _ = server.Serve(listener) }()
+	defer shutdownServer(t, server)
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	combiner := serverproto.NewPacketCombiner()
+	login := serverproto.NewLoginRequest(protocol.EMule, 4662, "prefix-client")
+	if err := writePacket(conn, combiner, "server.LoginRequest", &login); err != nil {
+		t.Fatalf("write login: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := readPacket(conn, &combiner); err != nil {
+			t.Fatalf("read login packet %d: %v", i, err)
+		}
+	}
+
+	body := prefixSearchBool(searchBoolOr,
+		prefixSearchString("ubuntu"),
+		prefixSearchString("demo"),
+	)
+	if err := writeRawPacket(conn, opSearchRequest, body); err != nil {
+		t.Fatalf("write recursive prefix search: %v", err)
+	}
+
+	packet, err := readPacket(conn, &combiner)
+	if err != nil {
+		t.Fatalf("read recursive search result: %v", err)
+	}
+	result, ok := packet.(*serverproto.SearchResult)
+	if !ok {
+		t.Fatalf("unexpected recursive search packet: %T", packet)
+	}
+	if result.MoreResults {
+		t.Fatalf("did not expect more results for recursive OR search")
+	}
+	if len(result.Results) != 2 {
+		t.Fatalf("unexpected recursive OR result count: %d", len(result.Results))
+	}
+	names := make([]string, 0, len(result.Results))
+	for _, entry := range result.Results {
+		name, ok := entry.StringTag(protocol.FTFilename)
+		if !ok {
+			t.Fatalf("missing filename tag in recursive search result")
+		}
+		names = append(names, name)
+	}
+	if !containsString(names, "ubuntu-24.04-desktop-amd64.iso") || !containsString(names, "demo-track.flac") {
+		t.Fatalf("unexpected recursive OR results: %+v", names)
+	}
+}
+
+func TestServerSearchSupportsRecursiveAndNotQueries(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CatalogPath = filepath.Join("..", "testdata", "catalog.json")
+	cfg.SearchBatchSize = 10
+	cfg.Message = "prefix-andnot"
+	cfg.AdminListenAddress = ""
+
+	catalog, err := LoadCatalog(cfg.CatalogPath)
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	server, err := NewServer(cfg, catalog, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() { _ = server.Serve(listener) }()
+	defer shutdownServer(t, server)
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	combiner := serverproto.NewPacketCombiner()
+	login := serverproto.NewLoginRequest(protocol.EMule, 4662, "prefix-andnot-client")
+	if err := writePacket(conn, combiner, "server.LoginRequest", &login); err != nil {
+		t.Fatalf("write login: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := readPacket(conn, &combiner); err != nil {
+			t.Fatalf("read login packet %d: %v", i, err)
+		}
+	}
+
+	body := prefixSearchBool(searchBoolAndNot,
+		prefixSearchTaggedString(protocol.FTFileType, "Iso"),
+		prefixSearchString("archlinux"),
+	)
+	if err := writeRawPacket(conn, opSearchRequest, body); err != nil {
+		t.Fatalf("write recursive ANDNOT search: %v", err)
+	}
+
+	packet, err := readPacket(conn, &combiner)
+	if err != nil {
+		t.Fatalf("read recursive ANDNOT result: %v", err)
+	}
+	result, ok := packet.(*serverproto.SearchResult)
+	if !ok {
+		t.Fatalf("unexpected recursive ANDNOT packet: %T", packet)
+	}
+	if len(result.Results) != 1 {
+		t.Fatalf("unexpected recursive ANDNOT result count: %d", len(result.Results))
+	}
+	if got, ok := result.Results[0].StringTag(protocol.FTFilename); !ok || got != "ubuntu-24.04-desktop-amd64.iso" {
+		t.Fatalf("unexpected recursive ANDNOT filename: %q %t", got, ok)
+	}
+}
+
+func TestInvalidSearchRequestReturnsEmptyResultsWithoutDisconnecting(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CatalogPath = filepath.Join("..", "testdata", "catalog.json")
+	cfg.SearchBatchSize = 10
+	cfg.Message = "invalid-search"
+	cfg.AdminListenAddress = ""
+
+	catalog, err := LoadCatalog(cfg.CatalogPath)
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	server, err := NewServer(cfg, catalog, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() { _ = server.Serve(listener) }()
+	defer shutdownServer(t, server)
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	combiner := serverproto.NewPacketCombiner()
+	login := serverproto.NewLoginRequest(protocol.EMule, 4662, "invalid-search-client")
+	if err := writePacket(conn, combiner, "server.LoginRequest", &login); err != nil {
+		t.Fatalf("write login: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := readPacket(conn, &combiner); err != nil {
+			t.Fatalf("read login packet %d: %v", i, err)
+		}
+	}
+
+	if err := writeRawPacket(conn, opSearchRequest, []byte{0xff}); err != nil {
+		t.Fatalf("write invalid search: %v", err)
+	}
+	packet, err := readPacket(conn, &combiner)
+	if err != nil {
+		t.Fatalf("read invalid search result: %v", err)
+	}
+	result, ok := packet.(*serverproto.SearchResult)
+	if !ok {
+		t.Fatalf("unexpected invalid search response: %T", packet)
+	}
+	if len(result.Results) != 0 || result.MoreResults {
+		t.Fatalf("unexpected invalid search result payload: %+v", result)
+	}
+
+	search := serverproto.SearchRequest{Query: "ubuntu"}
+	if err := writePacket(conn, combiner, "server.SearchRequest", &search); err != nil {
+		t.Fatalf("write follow-up valid search: %v", err)
+	}
+	packet, err = readPacket(conn, &combiner)
+	if err != nil {
+		t.Fatalf("read follow-up valid search result: %v", err)
+	}
+	result, ok = packet.(*serverproto.SearchResult)
+	if !ok || len(result.Results) != 1 {
+		t.Fatalf("unexpected follow-up search result: %T %+v", packet, result)
 	}
 }
 
@@ -617,6 +855,23 @@ func writeCustomPacket(conn net.Conn, opcode byte, packet protocol.Serializable)
 	return err
 }
 
+func writeRawPacket(conn net.Conn, opcode byte, body []byte) error {
+	header := protocol.PacketHeader{
+		Protocol: protocol.EdonkeyHeader,
+		Size:     int32(len(body) + 1),
+		Packet:   opcode,
+	}
+	var frame bytes.Buffer
+	if err := header.Put(&frame); err != nil {
+		return err
+	}
+	if _, err := frame.Write(body); err != nil {
+		return err
+	}
+	_, err := conn.Write(frame.Bytes())
+	return err
+}
+
 func readPacket(conn net.Conn, combiner *protocol.PacketCombiner) (protocol.Serializable, error) {
 	header, body, _, err := readFrame(conn)
 	if err != nil {
@@ -725,4 +980,38 @@ func assertUnauthorized(t *testing.T, url string) {
 
 func int32String(value int32) string {
 	return strconv.FormatInt(int64(value), 10)
+}
+
+func prefixSearchBool(operator byte, left, right []byte) []byte {
+	body := []byte{searchTypeBool, operator}
+	body = append(body, left...)
+	body = append(body, right...)
+	return body
+}
+
+func prefixSearchString(value string) []byte {
+	var body bytes.Buffer
+	body.WriteByte(searchTypeString)
+	_ = protocol.WriteUInt16(&body, uint16(len(value)))
+	_, _ = body.WriteString(value)
+	return body.Bytes()
+}
+
+func prefixSearchTaggedString(tagID byte, value string) []byte {
+	var body bytes.Buffer
+	body.WriteByte(searchTypeStrTag)
+	_ = protocol.WriteUInt16(&body, uint16(len(value)))
+	_, _ = body.WriteString(value)
+	_ = protocol.WriteUInt16(&body, 1)
+	body.WriteByte(tagID)
+	return body.Bytes()
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

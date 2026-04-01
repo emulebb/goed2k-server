@@ -319,31 +319,7 @@ func cloneFiles(files []FileRecord) []FileRecord {
 }
 
 func matchesRecord(record FileRecord, query SearchQuery) bool {
-	name := strings.ToLower(record.Name)
-	if query.FileType != "" && !strings.EqualFold(record.FileType, query.FileType) {
-		return false
-	}
-	if query.Extension != "" && !strings.EqualFold(record.Extension, query.Extension) {
-		return false
-	}
-	if query.MinSize > 0 && record.Size < query.MinSize {
-		return false
-	}
-	if query.MaxSize > 0 && record.Size > query.MaxSize {
-		return false
-	}
-	if query.MinSources > 0 && record.Sources < query.MinSources {
-		return false
-	}
-	if query.MinCompleteSources > 0 && record.CompleteSources < query.MinCompleteSources {
-		return false
-	}
-	for _, keyword := range query.Keywords {
-		if !strings.Contains(name, strings.ToLower(keyword)) {
-			return false
-		}
-	}
-	return true
+	return query.match(record)
 }
 
 func makeSharedFileEntry(record FileRecord) serverproto.SharedFileEntry {
