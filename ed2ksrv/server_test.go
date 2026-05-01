@@ -372,6 +372,117 @@ func TestOfferFilesRegistersDynamicSharedEntries(t *testing.T) {
 	}
 }
 
+func TestGetSourcesObfuscatedReturnsClientHashAndCryptOptionsForDynamicSources(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CatalogPath = filepath.Join("..", "testdata", "catalog.json")
+	cfg.SearchBatchSize = 10
+	cfg.AdminListenAddress = ""
+
+	catalog, err := LoadCatalog(cfg.CatalogPath)
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	server, err := NewServer(cfg, catalog, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() { _ = server.Serve(listener) }()
+	defer shutdownServer(t, server)
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	combiner := serverproto.NewPacketCombiner()
+	login := serverproto.NewLoginRequest(protocol.EMule, 4662, "obf-client")
+	login.Hash = protocol.MustHashFromString("61616161616161616161616161616161")
+	for idx := range login.Properties {
+		if login.Properties[idx].ID == ctServerFlags {
+			login.Properties[idx] = protocol.NewUInt32Tag(ctServerFlags, srvCapSupportCrypt|srvCapRequestCrypt)
+		}
+	}
+	if err := writePacket(conn, combiner, "server.LoginRequest", &login); err != nil {
+		t.Fatalf("write login: %v", err)
+	}
+
+	var assignedID int32
+	for i := 0; i < 3; i++ {
+		packet, err := readPacket(conn, &combiner)
+		if err != nil {
+			t.Fatalf("read login packet %d: %v", i, err)
+		}
+		if value, ok := packet.(*serverproto.IdChange); ok {
+			assignedID = value.ClientID
+		}
+	}
+	if assignedID == 0 {
+		t.Fatalf("expected assigned id")
+	}
+
+	offered := OfferFiles{
+		Entries: []serverproto.SharedFileEntry{
+			{
+				Hash: protocol.MustHashFromString("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+				Port: 4662,
+				Tags: protocol.TagList{
+					protocol.NewStringTag(protocol.FTFilename, "shared-runtime-video.mkv"),
+					protocol.NewUInt32Tag(protocol.FTFileSize, 123456),
+					protocol.NewStringTag(protocol.FTFileType, "Video"),
+					protocol.NewStringTag(protocol.FTFileFormat, "mkv"),
+				},
+			},
+		},
+	}
+	if err := writeCustomPacket(conn, opOfferFiles, &offered); err != nil {
+		t.Fatalf("write offer files: %v", err)
+	}
+	if _, err := readPacket(conn, &combiner); err != nil {
+		t.Fatalf("read offer status: %v", err)
+	}
+
+	getSources := serverproto.GetFileSources{Hash: protocol.MustHashFromString("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"), LowPart: 1}
+	if err := writeCustomPacket(conn, opGetSourcesObfu, &getSources); err != nil {
+		t.Fatalf("write obfuscated get sources: %v", err)
+	}
+	header, body, _, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read obfuscated sources frame: %v", err)
+	}
+	if header.Packet != opFoundSourcesObfu {
+		t.Fatalf("unexpected obfuscated sources opcode: 0x%02x", header.Packet)
+	}
+	if len(body) != 40 {
+		t.Fatalf("unexpected obfuscated sources body length: %d", len(body))
+	}
+	if !bytes.Equal(body[:16], getSources.Hash.Bytes()) {
+		t.Fatalf("unexpected obfuscated sources hash: %x", body[:16])
+	}
+	if body[16] != 1 {
+		t.Fatalf("unexpected obfuscated sources count: %d", body[16])
+	}
+	if got := int32(binary.LittleEndian.Uint32(body[17:21])); got != assignedID {
+		t.Fatalf("unexpected obfuscated source client id: %d", got)
+	}
+	if got := binary.LittleEndian.Uint16(body[21:23]); got != 4662 {
+		t.Fatalf("unexpected obfuscated source port: %d", got)
+	}
+	if got := body[23]; got != sourceObfuscationUserHashFlag|0x03 {
+		t.Fatalf("unexpected obfuscated source options: 0x%02x", got)
+	}
+	if !bytes.Equal(body[24:], login.Hash.Bytes()) {
+		t.Fatalf("unexpected obfuscated source user hash: %x", body[24:])
+	}
+}
+
 func TestServerSearchSupportsRecursivePrefixBooleanQueries(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CatalogPath = filepath.Join("..", "testdata", "catalog.json")

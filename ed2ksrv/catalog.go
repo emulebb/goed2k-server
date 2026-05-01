@@ -36,8 +36,10 @@ type FileRecord struct {
 
 // SourceEntry is a static peer endpoint returned by OP_GETSOURCES.
 type SourceEntry struct {
-	Host string `json:"host"`
-	Port int    `json:"port"`
+	Host               string `json:"host"`
+	Port               int    `json:"port"`
+	ObfuscationOptions uint8  `json:"obfuscation_options,omitempty"`
+	UserHash           string `json:"user_hash,omitempty"`
 }
 
 type catalogDisk struct {

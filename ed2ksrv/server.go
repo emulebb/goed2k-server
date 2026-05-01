@@ -3,7 +3,6 @@ package ed2ksrv
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,14 @@ import (
 
 	"github.com/monkeyWie/goed2k/protocol"
 	serverproto "github.com/monkeyWie/goed2k/protocol/server"
+)
+
+const (
+	ctServerFlags                 byte   = 0x20
+	srvCapSupportCrypt            uint32 = 0x0200
+	srvCapRequestCrypt            uint32 = 0x0400
+	srvCapRequireCrypt            uint32 = 0x0800
+	sourceObfuscationUserHashFlag uint8  = 0x80
 )
 
 // ServerStats is the admin-facing runtime metrics snapshot.
@@ -109,6 +116,7 @@ type clientSession struct {
 	mu      sync.Mutex
 
 	clientHash       protocol.Hash
+	connectOptions   byte
 	loginPoint       protocol.Endpoint
 	assignedID       int32
 	clientName       string
@@ -478,6 +486,7 @@ func (s *Server) dispatch(client *clientSession, packet byte, body []byte) error
 func (s *Server) handleLogin(client *clientSession, req serverproto.LoginRequest) error {
 	client.mu.Lock()
 	client.clientHash = req.Hash
+	client.connectOptions = extractClientConnectOptions(req.Properties)
 	client.loginPoint = req.Point
 	client.clientName = extractClientName(req.Properties)
 	client.assignedID = s.allocateClientID(client.remote)
@@ -497,11 +506,11 @@ func (s *Server) handleLogin(client *clientSession, req serverproto.LoginRequest
 		}
 	}
 	ic := idChangeExtended{
-		ClientID:             assignedID,
-		TCPFlags:             s.cfg.TCPFlags,
-		AuxPort:              s.cfg.AuxPort,
-		ReportedIP:           reportedIPForIdChange(assignedID),
-		ObfuscationTCPPort:   obfuscationTCPPortAdvertised(s.cfg, s.serverTCPPort()),
+		ClientID:           assignedID,
+		TCPFlags:           s.cfg.TCPFlags,
+		AuxPort:            s.cfg.AuxPort,
+		ReportedIP:         reportedIPForIdChange(assignedID),
+		ObfuscationTCPPort: obfuscationTCPPortAdvertised(s.cfg, s.serverTCPPort()),
 	}
 	return client.send("server.IdChange", &ic)
 }
@@ -583,7 +592,7 @@ func (s *Server) handleSearchMore(client *clientSession) error {
 }
 
 func (s *Server) handleGetSources(client *clientSession, req serverproto.GetFileSources, obfuscatedReply bool) error {
-	sources := s.sourcesAll(req.Hash)
+	sources := s.sourcesAll(req.Hash, obfuscatedReply)
 	if len(sources) > 255 {
 		sources = sources[:255]
 	}
@@ -594,7 +603,11 @@ func (s *Server) handleGetSources(client *clientSession, req serverproto.GetFile
 	if obfuscatedReply {
 		return client.sendFoundSourcesObfuscated(req.Hash, sources)
 	}
-	return client.send("server.FoundFileSources", &serverproto.FoundFileSources{Hash: req.Hash, Sources: sources})
+	endpoints := make([]protocol.Endpoint, 0, len(sources))
+	for _, source := range sources {
+		endpoints = append(endpoints, protocol.NewEndpoint(source.ClientID, source.Port))
+	}
+	return client.send("server.FoundFileSources", &serverproto.FoundFileSources{Hash: req.Hash, Sources: endpoints})
 }
 
 func (s *Server) handleCallback(client *clientSession, req serverproto.CallbackRequest) error {
@@ -716,17 +729,53 @@ func (s *Server) searchAll(query SearchQuery) []serverproto.SharedFileEntry {
 	return results
 }
 
-func (s *Server) sourcesAll(hash protocol.Hash) []protocol.Endpoint {
-	sources := s.catalog.Sources(hash)
+type foundSourceEntry struct {
+	ClientID           int32
+	Port               int
+	ObfuscationOptions uint8
+	UserHash           *protocol.Hash
+}
+
+func (s *Server) sourcesAll(hash protocol.Hash, obfuscated bool) []foundSourceEntry {
+	sources := make([]foundSourceEntry, 0)
+	if record, ok := s.catalog.Get(hash); ok {
+		for _, source := range record.Endpoints {
+			endpoint, err := protocol.EndpointFromString(source.Host, source.Port)
+			if err != nil {
+				continue
+			}
+			entry := foundSourceEntry{
+				ClientID: endpoint.IP(),
+				Port:     endpoint.Port(),
+			}
+			if obfuscated {
+				entry.ObfuscationOptions = source.ObfuscationOptions
+				if userHash, ok := parseSourceUserHash(source.UserHash); ok {
+					entry.UserHash = &userHash
+					entry.ObfuscationOptions |= sourceObfuscationUserHashFlag
+				}
+			}
+			sources = append(sources, entry)
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if shared, ok := s.dynamicFiles[hash.String()]; ok {
-		record := shared.materialize()
-		for _, source := range record.Endpoints {
+		for clientID, source := range shared.byClient {
 			endpoint, err := protocol.EndpointFromString(source.Host, source.Port)
-			if err == nil {
-				sources = append(sources, endpoint)
+			if err != nil {
+				continue
 			}
+			entry := foundSourceEntry{
+				ClientID: endpoint.IP(),
+				Port:     endpoint.Port(),
+			}
+			if obfuscated {
+				if client := s.clients[clientID]; client != nil {
+					entry.ObfuscationOptions, entry.UserHash = client.sourceObfuscationMetadata()
+				}
+			}
+			sources = append(sources, entry)
 		}
 	}
 	return sources
@@ -913,26 +962,28 @@ func (c *clientSession) sendLocked(typeName string, packet protocol.Serializable
 }
 
 // sendFoundSourcesObfuscated 回复 OP_FOUNDSOURCES_OBFU（0x44）：每源在 endpoint 后多 1 字节连接/混淆选项（aMule PartFile::AddSources）。
-func (c *clientSession) sendFoundSourcesObfuscated(hash protocol.Hash, sources []protocol.Endpoint) error {
+func (c *clientSession) sendFoundSourcesObfuscated(hash protocol.Hash, sources []foundSourceEntry) error {
 	body := &bytes.Buffer{}
 	if err := protocol.WriteHash(body, hash); err != nil {
 		return err
 	}
-	if len(sources) > 255 {
-		sources = sources[:255]
-	}
 	if err := body.WriteByte(byte(len(sources))); err != nil {
 		return err
 	}
-	for _, ep := range sources {
-		if err := protocol.WriteInt32(body, ep.IP()); err != nil {
+	for _, source := range sources {
+		if err := protocol.WriteInt32(body, source.ClientID); err != nil {
 			return err
 		}
-		if err := binary.Write(body, binary.LittleEndian, uint16(ep.Port())); err != nil {
+		if err := protocol.WriteUInt16(body, uint16(source.Port)); err != nil {
 			return err
 		}
-		if err := body.WriteByte(0); err != nil {
+		if err := body.WriteByte(source.ObfuscationOptions); err != nil {
 			return err
+		}
+		if source.UserHash != nil {
+			if _, err := body.Write(source.UserHash.Bytes()); err != nil {
+				return err
+			}
 		}
 	}
 	return c.sendRawEd2k(opFoundSourcesObfu, body.Bytes())
@@ -1053,6 +1104,51 @@ func extractClientName(tags protocol.TagList) string {
 		}
 	}
 	return ""
+}
+
+func extractClientConnectOptions(tags protocol.TagList) uint8 {
+	for _, tag := range tags {
+		if tag.ID != ctServerFlags {
+			continue
+		}
+		flags := uint32(tag.UInt64)
+		var options uint8
+		if flags&srvCapSupportCrypt != 0 {
+			options |= 0x01
+		}
+		if flags&srvCapRequestCrypt != 0 {
+			options |= 0x02
+		}
+		if flags&srvCapRequireCrypt != 0 {
+			options |= 0x04
+		}
+		return options
+	}
+	return 0
+}
+
+func (c *clientSession) sourceObfuscationMetadata() (uint8, *protocol.Hash) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	options := c.connectOptions
+	if options == 0 || c.clientHash.IsZero() {
+		return options, nil
+	}
+	hash := c.clientHash
+	options |= sourceObfuscationUserHashFlag
+	return options, &hash
+}
+
+func parseSourceUserHash(value string) (protocol.Hash, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return protocol.Hash{}, false
+	}
+	hash, err := protocol.HashFromString(value)
+	if err != nil {
+		return protocol.Hash{}, false
+	}
+	return hash, true
 }
 
 func clientIDFromRemote(addr *net.TCPAddr) int32 {
