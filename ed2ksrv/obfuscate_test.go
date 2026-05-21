@@ -32,9 +32,8 @@ func TestServerObfuscatedHandshakeIgnoresPeekedMarkerBeforeDH(t *testing.T) {
 		results <- handshakeResult{conn: conn, err: err}
 	}()
 
-	clientReadRC4, clientWriteRC4 := runClientObfuscationHandshake(t, clientSide, clientPrivate, gaBuf)
+	_, clientWriteRC4 := runClientObfuscationHandshake(t, clientSide, clientPrivate, gaBuf)
 	writeEncryptedClientFrame(t, clientSide, clientWriteRC4, opGetServerList, nil)
-	readAndDecryptServerFinalHandshake(t, clientSide, clientReadRC4)
 
 	result := <-results
 	if result.err != nil {
@@ -125,25 +124,5 @@ func writeEncryptedClientFrame(t *testing.T, conn net.Conn, rc4 *amuleRC4, opcod
 	rc4.xorInPlace(payload)
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatalf("write encrypted ED2K frame: %v", err)
-	}
-}
-
-func readAndDecryptServerFinalHandshake(t *testing.T, conn net.Conn, rc4 *amuleRC4) {
-	t.Helper()
-	tail := make([]byte, 6)
-	if _, err := io.ReadFull(conn, tail); err != nil {
-		t.Fatalf("read final server handshake: %v", err)
-	}
-	rc4.xorInPlace(tail)
-	if binary.LittleEndian.Uint32(tail[0:4]) != magicValueSync {
-		t.Fatalf("unexpected final server magic: 0x%x", binary.LittleEndian.Uint32(tail[0:4]))
-	}
-	padding := int(tail[5])
-	if padding > 0 {
-		pad := make([]byte, padding)
-		if _, err := io.ReadFull(conn, pad); err != nil {
-			t.Fatalf("read final server padding: %v", err)
-		}
-		rc4.xorInPlace(pad)
 	}
 }

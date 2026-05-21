@@ -252,26 +252,6 @@ func serverObfuscatedHandshake(conn net.Conn, firstByte byte) (net.Conn, error) 
 		recvRC4.xorInPlace(chunk[:n])
 	}
 
-	var rb3 [1]byte
-	if _, err := rand.Read(rb3[:]); err != nil {
-		return nil, err
-	}
-	pad3 := int(rb3[0] % 16)
-	resp := make([]byte, 6+pad3)
-	binary.LittleEndian.PutUint32(resp[0:4], magicValueSync)
-	resp[4] = enmObfuscation
-	resp[5] = byte(pad3)
-	if pad3 > 0 {
-		if _, err := rand.Read(resp[6:]); err != nil {
-			return nil, err
-		}
-	}
-	respEnc := append([]byte(nil), resp...)
-	sendRC4.xorInPlace(respEnc)
-	if _, err := conn.Write(respEnc); err != nil {
-		return nil, err
-	}
-
 	var leftover []byte
 	if n > 0 {
 		leftover = append([]byte(nil), chunk[:n]...)
