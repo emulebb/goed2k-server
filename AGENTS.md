@@ -1,7 +1,7 @@
 # ED2K Server Repo Rules
 
 - Follow the shared workspace policy in
-  `%EMULE_WORKSPACE_ROOT%\repos\eMule-tooling\docs\WORKSPACE-POLICY.md`.
+  `%EMULE_WORKSPACE_ROOT%\repos\emulebb-tooling\docs\WORKSPACE-POLICY.md`.
 - Use `README.md` as the canonical ED2K server docs home.
 - Use eMule workspace planning and progress docs as the active backlog for
   eMule BB integration work.
