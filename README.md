@@ -52,6 +52,10 @@ The goal is not to replicate the full official eMule server, but to provide a ru
 - [config.example.json](config.example.json): sample config
 - [testdata/catalog.json](testdata/catalog.json): sample shared catalog
 
+## Design documents
+
+- [LegacyED2KServer gap design index](docs/legacy-ed2k-server/README.md): protocol and operational parity gaps to consider for a fuller ED2K server implementation
+
 ## Install and import
 
 ### Run as a CLI
