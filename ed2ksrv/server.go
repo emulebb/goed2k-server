@@ -529,6 +529,10 @@ func (s *Server) handleOfferFiles(client *clientSession, req OfferFiles) error {
 	client.mu.Lock()
 	clientID := client.assignedID
 	listenPort := client.loginPoint.Port()
+	remoteHost := ""
+	if client.remote != nil && client.remote.IP != nil {
+		remoteHost = client.remote.IP.String()
+	}
 	client.mu.Unlock()
 	if clientID == 0 {
 		return fmt.Errorf("client must login before offering files")
@@ -539,7 +543,7 @@ func (s *Server) handleOfferFiles(client *clientSession, req OfferFiles) error {
 		if err != nil {
 			return err
 		}
-		source, ok := sourceFromSharedEntry(clientID, listenPort, entry)
+		source, ok := sourceFromSharedEntry(clientID, listenPort, remoteHost, entry)
 		if ok {
 			record.Endpoints = []SourceEntry{source}
 		}
@@ -907,7 +911,7 @@ func mergeDynamicFileRecord(dst, src FileRecord) FileRecord {
 	return dst
 }
 
-func sourceFromSharedEntry(clientID int32, listenPort int, entry serverproto.SharedFileEntry) (SourceEntry, bool) {
+func sourceFromSharedEntry(clientID int32, listenPort int, remoteHost string, entry serverproto.SharedFileEntry) (SourceEntry, bool) {
 	ip := entry.ClientID
 	port := int(entry.Port)
 	if ip == 0 || port == 0 || uint32(ip) == 0xfbfbfbfb || uint32(ip) == 0xfcfcfcfc {
@@ -922,7 +926,22 @@ func sourceFromSharedEntry(clientID int32, listenPort int, entry serverproto.Sha
 	if idx := strings.LastIndex(host, ":"); idx >= 0 {
 		host = host[:idx]
 	}
+	if shouldPreferObservedRemoteSource(host, remoteHost) {
+		host = remoteHost
+	}
 	return SourceEntry{Host: host, Port: port}, true
+}
+
+func shouldPreferObservedRemoteSource(host string, remoteHost string) bool {
+	if remoteHost == "" || host == "" || host == remoteHost {
+		return false
+	}
+	remoteIP := net.ParseIP(remoteHost)
+	if remoteIP == nil || (!remoteIP.IsPrivate() && !remoteIP.IsLoopback()) {
+		return false
+	}
+	sourceIP := net.ParseIP(host)
+	return sourceIP != nil && !sourceIP.Equal(remoteIP)
 }
 
 func (s *Server) persistCatalog() error {

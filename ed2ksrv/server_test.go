@@ -341,6 +341,18 @@ func TestOfferFilesRegistersDynamicSharedEntries(t *testing.T) {
 	if status.FilesCount != 4 {
 		t.Fatalf("unexpected files count after offer: %d", status.FilesCount)
 	}
+	localAddr, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok || localAddr.IP == nil {
+		t.Fatalf("unexpected local address for dynamic source test: %v", conn.LocalAddr())
+	}
+	expectedSourceHost := localAddr.IP.String()
+	offeredRecord, ok := server.FileSnapshot(protocol.MustHashFromString("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"))
+	if !ok || len(offeredRecord.Endpoints) != 1 {
+		t.Fatalf("offered file was not registered with one dynamic endpoint: %+v", offeredRecord)
+	}
+	if offeredRecord.Endpoints[0].Host != expectedSourceHost || offeredRecord.Endpoints[0].Port != 4662 {
+		t.Fatalf("unexpected dynamic endpoint from offered file: %+v", offeredRecord.Endpoints[0])
+	}
 
 	search := serverproto.SearchRequest{Query: "shared runtime", FileType: "Video", Extension: "mkv"}
 	if err := writePacket(conn, combiner, "server.SearchRequest", &search); err != nil {
