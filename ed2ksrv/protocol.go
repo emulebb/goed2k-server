@@ -18,11 +18,11 @@ const (
 	opCallbackReq      byte = 0x1C
 	opSearchMore       byte = 0x21
 	opFoundSourcesObfu byte = 0x44 // OP_FOUNDSOURCES_OBFU，每源在 IP:端口后多 1 字节 crypt options
-	searchTypeBool   byte = 0x00
-	searchTypeString byte = 0x01
-	searchTypeStrTag byte = 0x02
-	searchTypeUint32 byte = 0x03
-	searchTypeUint64 byte = 0x08
+	searchTypeBool     byte = 0x00
+	searchTypeString   byte = 0x01
+	searchTypeStrTag   byte = 0x02
+	searchTypeUint32   byte = 0x03
+	searchTypeUint64   byte = 0x08
 
 	searchOpEqual        byte = 0x00
 	searchOpGreater      byte = 0x01
@@ -375,7 +375,7 @@ func (e searchCompoundExpr) collectSummary(query *SearchQuery) bool {
 }
 
 func (e searchKeywordExpr) match(record FileRecord) bool {
-	return strings.Contains(strings.ToLower(record.Name), strings.ToLower(e.value))
+	return keywordMatchesRecord(record, e.value)
 }
 
 func (e searchKeywordExpr) collectSummary(query *SearchQuery) bool {
@@ -552,7 +552,6 @@ func compareInt(left int, operator byte, right int) bool {
 }
 
 func matchesLegacySearch(record FileRecord, query SearchQuery) bool {
-	name := strings.ToLower(record.Name)
 	if query.FileType != "" && !strings.EqualFold(record.FileType, query.FileType) {
 		return false
 	}
@@ -587,11 +586,31 @@ func matchesLegacySearch(record FileRecord, query SearchQuery) bool {
 		return false
 	}
 	for _, keyword := range query.Keywords {
-		if !strings.Contains(name, strings.ToLower(keyword)) {
+		if !keywordMatchesRecord(record, keyword) {
 			return false
 		}
 	}
 	return true
+}
+
+func keywordMatchesRecord(record FileRecord, keyword string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(keyword))
+	if normalized == "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(record.Name), normalized) {
+		return true
+	}
+	hashToken := strings.TrimPrefix(normalized, "ed2k::")
+	if len(hashToken) != 32 {
+		return false
+	}
+	for _, char := range hashToken {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return strings.EqualFold(record.Hash.String(), hashToken)
 }
 
 func applyRangeInt64Summary(minValue, maxValue *int64, operator byte, value int64) {

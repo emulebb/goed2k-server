@@ -38,20 +38,22 @@ func TestGlobServStatUDPReply(t *testing.T) {
 		t.Fatalf("new server: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	udpHost := localUDPTestHost()
+	listener := listenTCPWithAvailableUDPOffset(t, udpHost, cfg.UDPPortOffset)
 	defer listener.Close()
 
 	go func() { _ = server.Serve(listener) }()
 	defer shutdownServer(t, server)
 
 	tcpAddr := listener.Addr().(*net.TCPAddr)
-	udpTarget := net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpAddr.Port+4))
-	udpConn, err := net.Dial("udp", udpTarget)
+	udpTarget := net.JoinHostPort(udpHost, strconv.Itoa(tcpAddr.Port+4))
+	udpAddr, err := net.ResolveUDPAddr("udp4", udpTarget)
 	if err != nil {
-		t.Fatalf("dial udp: %v", err)
+		t.Fatalf("resolve udp: %v", err)
+	}
+	udpConn, err := net.ListenPacket("udp4", net.JoinHostPort(udpHost, "0"))
+	if err != nil {
+		t.Fatalf("listen udp client: %v", err)
 	}
 	defer udpConn.Close()
 
@@ -59,14 +61,25 @@ func TestGlobServStatUDPReply(t *testing.T) {
 	req[0] = ed2kUDPHeader
 	req[1] = opGlobServStatReq
 	binary.LittleEndian.PutUint32(req[2:6], 0x11223344)
-	if _, err := udpConn.Write(req); err != nil {
-		t.Fatalf("write udp: %v", err)
-	}
-	_ = udpConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	resp := make([]byte, 64)
-	n, err := udpConn.Read(resp)
-	if err != nil {
-		t.Fatalf("read udp: %v", err)
+	var n int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := udpConn.WriteTo(req, udpAddr); err != nil {
+			t.Fatalf("write udp: %v", err)
+		}
+		_ = udpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		read, _, err := udpConn.ReadFrom(resp)
+		if err == nil {
+			n = read
+			break
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("read udp: %v", err)
+		}
+	}
+	if n == 0 {
+		t.Fatalf("timed out waiting for UDP stats response from %s", udpTarget)
 	}
 	if n != 2+globServStatResSize {
 		t.Fatalf("expected %d bytes, got %d", 2+globServStatResSize, n)
@@ -87,6 +100,43 @@ func TestGlobServStatUDPReply(t *testing.T) {
 	if binary.LittleEndian.Uint32(p[12:16]) != 777 {
 		t.Fatalf("max users")
 	}
+}
+
+func localUDPTestHost() string {
+	if host := strings.TrimSpace(os.Getenv("X_LOCAL_IP")); host != "" {
+		return host
+	}
+	return "127.0.0.1"
+}
+
+func listenTCPWithAvailableUDPOffset(t *testing.T, host string, offset int) net.Listener {
+	t.Helper()
+	if offset <= 0 {
+		offset = 4
+	}
+	for attempt := 0; attempt < 100; attempt++ {
+		probe, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			t.Fatalf("listen tcp probe: %v", err)
+		}
+		tcpAddr := probe.Addr().(*net.TCPAddr)
+		port := tcpAddr.Port
+		_ = probe.Close()
+		if port+offset > 65535 {
+			continue
+		}
+		udpProbe, err := net.ListenPacket("udp4", net.JoinHostPort(host, strconv.Itoa(port+offset)))
+		if err != nil {
+			continue
+		}
+		_ = udpProbe.Close()
+		listener, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			return listener
+		}
+	}
+	t.Fatalf("could not allocate TCP port with available UDP offset %d", offset)
+	return nil
 }
 
 func TestParseSearchRequestMatchesGoed2KEncoding(t *testing.T) {
@@ -142,6 +192,36 @@ func TestParseSearchRequestSupportsRecursivePrefixBooleanTree(t *testing.T) {
 	}
 	if matchesRecord(other, query) {
 		t.Fatalf("did not expect unrelated record to match recursive OR query")
+	}
+}
+
+func TestSearchKeywordMatchesED2KHashTokens(t *testing.T) {
+	hash, err := protocol.HashFromString("00112233445566778899AABBCCDDEEFF")
+	if err != nil {
+		t.Fatalf("parse hash: %v", err)
+	}
+	record := FileRecord{
+		Hash: hash,
+		Name: "hash-token-target.bin",
+		Size: 4096,
+	}
+
+	for _, keyword := range []string{
+		"ed2k::00112233445566778899aabbccddeeff",
+		"00112233445566778899AABBCCDDEEFF",
+	} {
+		t.Run(keyword, func(t *testing.T) {
+			if !(searchKeywordExpr{value: keyword}).match(record) {
+				t.Fatalf("recursive keyword did not match record hash")
+			}
+			if !matchesLegacySearch(record, SearchQuery{Keywords: []string{keyword}}) {
+				t.Fatalf("legacy keyword did not match record hash")
+			}
+		})
+	}
+
+	if (searchKeywordExpr{value: "ed2k::00112233445566778899aabbccddeef0"}).match(record) {
+		t.Fatalf("wrong ED2K hash matched record")
 	}
 }
 
