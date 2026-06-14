@@ -24,5 +24,5 @@ Everything below is this repo's local deltas only:
 - Resolve the eMule harness only through `EMULEBB_WORKSPACE_ROOT`.
 - Before finishing Go changes, run:
   - `go test ./...`
-  - `go build -o $env:EMULEBB_WORKSPACE_ROOT\workspaces\workspace\state\tools\goed2k-server\goed2k-server.exe .\cmd\goed2k-server`
+  - `go build -o $env:EMULEBB_WORKSPACE_OUTPUT_ROOT\tools\goed2k-server\goed2k-server.exe .\cmd\goed2k-server`
 - Do not add shell wrapper launchers.
