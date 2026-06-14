@@ -12,6 +12,7 @@ import (
 const (
 	opLoginRequest     byte = 0x01
 	opGetServerList    byte = 0x14
+	opServerList       byte = 0x32 // OP_SERVERLIST reply: uint8 count + count×(4-byte IP + 2-byte port)
 	opSearchRequest    byte = 0x16
 	opGetSources       byte = 0x19
 	opGetSourcesObfu   byte = 0x23 // OP_GETSOURCES_OBFU，与 OP_GETSOURCES 请求体相同，应答需用 OP_FOUNDSOURCES_OBFU
@@ -40,7 +41,11 @@ const (
 
 // SearchQuery is the server-side view of an incoming ED2K search request.
 type SearchQuery struct {
-	Root               searchExpr
+	Root searchExpr
+	// summarized is true when the whole expression is a pure-AND tree, so every
+	// entry in Keywords is REQUIRED for a match (which lets the catalog narrow
+	// candidates via its keyword/trigram index instead of scanning all files).
+	summarized         bool
 	Keywords           []string
 	MinSize            int64
 	MaxSize            int64
@@ -91,16 +96,30 @@ type searchTagRef struct {
 	hasID bool
 }
 
+// defaultMaxSearchDepth bounds boolean-tree recursion for the TCP path. UDP
+// callers pass their own (typically tighter) limit via ParseSearchRequestLimited.
+const defaultMaxSearchDepth = 64
+
 // ParseSearchRequest decodes ED2K search requests.
 //
 // It prefers Lugdunum-style recursive-prefix expressions and falls back to the
 // legacy linear encoding currently emitted by the local goed2k helper.
 func ParseSearchRequest(body []byte) (SearchQuery, error) {
+	return ParseSearchRequestLimited(body, defaultMaxSearchDepth)
+}
+
+// ParseSearchRequestLimited decodes an ED2K search request while rejecting
+// boolean trees deeper than maxDepth. This bounds stack recursion when parsing
+// untrusted datagrams on the UDP search path.
+func ParseSearchRequestLimited(body []byte, maxDepth int) (SearchQuery, error) {
 	if len(body) == 0 {
 		return SearchQuery{Root: searchMatchAllExpr{}}, nil
 	}
+	if maxDepth <= 0 {
+		maxDepth = defaultMaxSearchDepth
+	}
 
-	prefixQuery, prefixErr := parseRecursiveSearchRequest(body)
+	prefixQuery, prefixErr := parseRecursiveSearchRequest(body, maxDepth)
 	if prefixErr == nil {
 		return prefixQuery, nil
 	}
@@ -113,9 +132,9 @@ func ParseSearchRequest(body []byte) (SearchQuery, error) {
 	return SearchQuery{}, fmt.Errorf("parse recursive search: %v; parse legacy search: %v", prefixErr, legacyErr)
 }
 
-func parseRecursiveSearchRequest(body []byte) (SearchQuery, error) {
+func parseRecursiveSearchRequest(body []byte, maxDepth int) (SearchQuery, error) {
 	reader := bytes.NewReader(body)
-	root, err := parseRecursiveSearchExpr(reader)
+	root, err := parseRecursiveSearchExpr(reader, 0, maxDepth)
 	if err != nil {
 		return SearchQuery{}, err
 	}
@@ -125,7 +144,10 @@ func parseRecursiveSearchRequest(body []byte) (SearchQuery, error) {
 	return makeSearchQuery(root), nil
 }
 
-func parseRecursiveSearchExpr(reader *bytes.Reader) (searchExpr, error) {
+func parseRecursiveSearchExpr(reader *bytes.Reader, depth, maxDepth int) (searchExpr, error) {
+	if depth > maxDepth {
+		return nil, fmt.Errorf("search tree exceeds max depth %d", maxDepth)
+	}
 	termType, err := reader.ReadByte()
 	if err != nil {
 		return nil, err
@@ -140,11 +162,11 @@ func parseRecursiveSearchExpr(reader *bytes.Reader) (searchExpr, error) {
 		if operator > searchBoolNotAnd {
 			return nil, fmt.Errorf("unsupported boolean operator: 0x%02x", operator)
 		}
-		left, err := parseRecursiveSearchExpr(reader)
+		left, err := parseRecursiveSearchExpr(reader, depth+1, maxDepth)
 		if err != nil {
 			return nil, err
 		}
-		right, err := parseRecursiveSearchExpr(reader)
+		right, err := parseRecursiveSearchExpr(reader, depth+1, maxDepth)
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +307,7 @@ func parseLegacyNumericExpr(reader *bytes.Reader, value uint64) (searchExpr, err
 func makeSearchQuery(root searchExpr) SearchQuery {
 	query := SearchQuery{Root: root}
 	if root != nil {
-		root.collectSummary(&query)
+		query.summarized = root.collectSummary(&query)
 	}
 	return query
 }
@@ -598,6 +620,10 @@ func keywordMatchesRecord(record FileRecord, keyword string) bool {
 	if normalized == "" {
 		return true
 	}
+	// Substring match is intentional: real clients (e.g. emulebb-rust) send the
+	// whole dotted query as one keyword term and rely on the server matching it as
+	// a substring of the file name. (This is why a token index cannot replace this
+	// matcher without changing observed results — see parity notes.)
 	if strings.Contains(strings.ToLower(record.Name), normalized) {
 		return true
 	}

@@ -2,6 +2,7 @@ package ed2ksrv
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -14,9 +15,10 @@ type Catalog struct {
 	path  string
 	store catalogStore
 
-	mu     sync.RWMutex
-	files  []FileRecord
-	byHash map[string]FileRecord
+	mu       sync.RWMutex
+	files    []FileRecord
+	byHash   map[string]FileRecord
+	triIndex map[string][]int // lowercase name trigram -> sorted file indices
 }
 
 // FileRecord describes a searchable file and the peers that can serve it.
@@ -143,21 +145,102 @@ func (c *Catalog) Get(hash protocol.Hash) (FileRecord, bool) {
 	return record, true
 }
 
-// Search applies the decoded ED2K search filters against the catalog.
+// Search applies the decoded ED2K search filters against the catalog. When the
+// query has a required keyword it uses the trigram index to narrow candidates
+// before the full predicate runs; otherwise it scans all files. Results are
+// identical to a full scan (the index only produces a superset of candidates).
 func (c *Catalog) Search(query SearchQuery) []serverproto.SharedFileEntry {
 	if c == nil {
 		return nil
 	}
 	c.mu.RLock()
-	results := make([]serverproto.SharedFileEntry, 0, len(c.files))
-	for _, record := range c.files {
-		if !matchesRecord(record, query) {
+	defer c.mu.RUnlock()
+	candidates := c.searchCandidatesLocked(query)
+	if candidates == nil { // full scan
+		results := make([]serverproto.SharedFileEntry, 0, len(c.files))
+		for _, record := range c.files {
+			if matchesRecord(record, query) {
+				results = append(results, makeSharedFileEntry(record))
+			}
+		}
+		return results
+	}
+	results := make([]serverproto.SharedFileEntry, 0, len(candidates))
+	for _, idx := range candidates {
+		if matchesRecord(c.files[idx], query) {
+			results = append(results, makeSharedFileEntry(c.files[idx]))
+		}
+	}
+	return results
+}
+
+// searchCandidatesLocked returns a sorted superset of file indices that can match
+// query, using the trigram index, or nil to signal "scan all files". Caller holds
+// c.mu (read). Safe: a file whose name contains a required keyword as a substring
+// contains all of that keyword's trigrams, so it is always in the intersection.
+func (c *Catalog) searchCandidatesLocked(query SearchQuery) []int {
+	if !query.summarized || len(c.triIndex) == 0 {
+		return nil
+	}
+	key := ""
+	for _, kw := range query.Keywords {
+		k := strings.ToLower(strings.TrimSpace(kw))
+		if len(k) >= 3 && len(k) > len(key) {
+			key = k
+		}
+	}
+	if key == "" {
+		return nil // no keyword long enough to index on; scan
+	}
+	grams := uniqueTrigrams(key)
+	counts := make(map[int]int, 16)
+	for _, g := range grams {
+		postings, ok := c.triIndex[g]
+		if !ok {
+			return []int{} // a required trigram is absent -> no file can match
+		}
+		for _, idx := range postings {
+			counts[idx]++
+		}
+	}
+	candidates := make([]int, 0, len(counts))
+	for idx, n := range counts {
+		if n == len(grams) {
+			candidates = append(candidates, idx)
+		}
+	}
+	sort.Ints(candidates)
+	return candidates
+}
+
+// rebuildSearchIndexLocked rebuilds the trigram index from c.files. Caller holds c.mu (write).
+func (c *Catalog) rebuildSearchIndexLocked() {
+	index := make(map[string][]int, len(c.files))
+	for idx := range c.files {
+		for _, g := range uniqueTrigrams(strings.ToLower(c.files[idx].Name)) {
+			index[g] = append(index[g], idx)
+		}
+	}
+	c.triIndex = index
+}
+
+// uniqueTrigrams returns the distinct 3-byte substrings of s (already lowercased
+// by callers). Matching is byte-substring, consistent with keywordMatchesRecord.
+func uniqueTrigrams(s string) []string {
+	if len(s) < 3 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(s))
+	out := make([]string, 0, len(s)-2)
+	for i := 0; i+3 <= len(s); i++ {
+		g := s[i : i+3]
+		if _, dup := seen[g]; dup {
 			continue
 		}
-		results = append(results, makeSharedFileEntry(record))
+		seen[g] = struct{}{}
+		out = append(out, g)
 	}
-	c.mu.RUnlock()
-	return results
+	return out
 }
 
 // Sources returns all configured peer endpoints for the given file hash.
@@ -208,6 +291,7 @@ func (c *Catalog) Upsert(record FileRecord) error {
 		c.files = append(c.files, normalized)
 	}
 	c.byHash[key] = normalized
+	c.rebuildSearchIndexLocked()
 	return nil
 }
 
@@ -229,6 +313,7 @@ func (c *Catalog) Delete(hash protocol.Hash) bool {
 			break
 		}
 	}
+	c.rebuildSearchIndexLocked()
 	return true
 }
 
@@ -250,6 +335,7 @@ func (c *Catalog) ReplaceAll(files []FileRecord) error {
 	c.mu.Lock()
 	c.files = normalized
 	c.byHash = byHash
+	c.rebuildSearchIndexLocked()
 	c.mu.Unlock()
 	return nil
 }

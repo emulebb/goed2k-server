@@ -31,6 +31,24 @@ type Config struct {
 	DatabaseDSN        string `json:"database_dsn"`
 	DatabaseTable      string `json:"database_table"`
 	SearchBatchSize    int    `json:"search_batch_size"`
+	// MaxSourcesPerReply caps how many sources a GetSources reply returns (TCP and
+	// UDP). Bounded to the ED2K protocol limit of 255.
+	MaxSourcesPerReply int `json:"max_sources_per_reply"`
+	// MaxConnsPerIPPerSecond rate-limits new TCP connections per source IP. 0
+	// disables the limiter (default); set a positive value to enable abuse control.
+	MaxConnsPerIPPerSecond int `json:"max_conns_per_ip_per_second"`
+	// MaxOfferedFilesPerClient caps how many shared files one client may publish
+	// via OP_OFFERFILES (excess entries are dropped). 0 disables the cap (default).
+	MaxOfferedFilesPerClient int `json:"max_offered_files_per_client"`
+	// MaxCallbacksPerIPPerSecond rate-limits callback requests (TCP + UDP) per
+	// source IP. 0 disables the limiter (default).
+	MaxCallbacksPerIPPerSecond int `json:"max_callbacks_per_ip_per_second"`
+	// PeerServers lists additional ED2K servers ("ip:port") advertised to clients
+	// in the OP_SERVERLIST reply alongside this server. Empty by default.
+	PeerServers []string `json:"peer_servers"`
+	// MaxTCPSearchResults caps the total number of results a single TCP search may
+	// return (across all SearchMore pages). 0 means unlimited (default).
+	MaxTCPSearchResults int `json:"max_tcp_search_results"`
 	TCPFlags           int32  `json:"tcp_flags"`
 	AuxPort            int32  `json:"aux_port"`
 	// ProtocolObfuscation enables eMule-style TCP obfuscation (DH + RC4) on the ED2K listener when the client starts with a non-ED2K first byte.
@@ -41,6 +59,43 @@ type Config struct {
 	SoftFilesLimit     int32  `json:"soft_files_limit"`
 	HardFilesLimit     int32  `json:"hard_files_limit"`
 	MaxUsersAdvertised uint32 `json:"max_users_advertised"`
+	// UDP holds the UDP search / source-lookup service settings (the high-volume
+	// client path: OP_GLOBSEARCHREQ* and OP_GLOBGETSOURCES*).
+	UDP UDPConfig `json:"udp"`
+	// PacketTrace enables structured per-frame tracing of every ED2K packet
+	// (TCP and UDP, both directions). Off by default.
+	PacketTrace bool `json:"packet_trace"`
+	// PacketTracePath, when set, appends JSON-line packet traces to this file in
+	// addition to the logger. Honors the workspace output-root policy.
+	PacketTracePath string `json:"packet_trace_path"`
+	// PacketTraceMaxBytes bounds how many payload bytes are hex-dumped per frame.
+	PacketTraceMaxBytes int `json:"packet_trace_max_bytes"`
+}
+
+// UDPConfig configures the ED2K UDP search and source-lookup service.
+type UDPConfig struct {
+	SearchEnabled         bool `json:"search_enabled"`
+	SourcesEnabled        bool `json:"sources_enabled"`
+	MaxPayloadBytes       int  `json:"max_payload_bytes"`
+	MaxResults            int  `json:"max_results"`
+	SearchWorkers         int  `json:"search_workers"`
+	SearchQueueSize       int  `json:"search_queue_size"`
+	PerIPPacketsPerSecond int  `json:"per_ip_packets_per_second"`
+	MaxASTDepth           int  `json:"max_ast_depth"`
+}
+
+// DefaultUDPConfig returns the baseline UDP service settings.
+func DefaultUDPConfig() UDPConfig {
+	return UDPConfig{
+		SearchEnabled:         true,
+		SourcesEnabled:        true,
+		MaxPayloadBytes:       1300,
+		MaxResults:            200,
+		SearchWorkers:         4,
+		SearchQueueSize:       1024,
+		PerIPPacketsPerSecond: 20,
+		MaxASTDepth:           24,
+	}
 }
 
 // DefaultConfig returns a working baseline configuration.
@@ -61,6 +116,8 @@ func DefaultConfig() Config {
 		SoftFilesLimit:      5000,
 		HardFilesLimit:      200000,
 		MaxUsersAdvertised:  500000,
+		UDP:                 DefaultUDPConfig(),
+		PacketTraceMaxBytes: 64,
 	}
 }
 
@@ -81,6 +138,9 @@ func (c Config) Normalize() (Config, error) {
 	if c.SearchBatchSize <= 0 {
 		c.SearchBatchSize = defaultBatchSize
 	}
+	if c.MaxSourcesPerReply <= 0 || c.MaxSourcesPerReply > 255 {
+		c.MaxSourcesPerReply = 255
+	}
 	if c.UDPPortOffset == 0 {
 		c.UDPPortOffset = 4
 	}
@@ -89,6 +149,27 @@ func (c Config) Normalize() (Config, error) {
 	}
 	if c.HardFilesLimit <= 0 {
 		c.HardFilesLimit = 200000
+	}
+	if c.UDP.MaxPayloadBytes <= 0 {
+		c.UDP.MaxPayloadBytes = 1300
+	}
+	if c.UDP.MaxResults <= 0 {
+		c.UDP.MaxResults = 200
+	}
+	if c.UDP.SearchWorkers <= 0 {
+		c.UDP.SearchWorkers = 4
+	}
+	if c.UDP.SearchQueueSize <= 0 {
+		c.UDP.SearchQueueSize = 1024
+	}
+	if c.UDP.PerIPPacketsPerSecond <= 0 {
+		c.UDP.PerIPPacketsPerSecond = 20
+	}
+	if c.UDP.MaxASTDepth <= 0 {
+		c.UDP.MaxASTDepth = 24
+	}
+	if c.PacketTraceMaxBytes <= 0 {
+		c.PacketTraceMaxBytes = 64
 	}
 	if c.StorageBackend == "" {
 		c.StorageBackend = storageBackendJSON

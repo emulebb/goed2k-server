@@ -2,13 +2,16 @@ package ed2ksrv
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +19,47 @@ import (
 	"github.com/monkeyWie/goed2k/protocol"
 	serverproto "github.com/monkeyWie/goed2k/protocol/server"
 )
+
+// maxDecodedFrameBytes caps the inflated size of a single packed (zlib) ED2K
+// frame, bounding memory and guarding against decompression bombs.
+const maxDecodedFrameBytes = 1 << 20
+
+// minPackBodyBytes is the smallest frame payload worth attempting to compress on
+// the way out; small control packets are never packed.
+const minPackBodyBytes = 256
+
+// maybePackFrame re-encodes a plain ED2K frame as a packed (zlib) frame when the
+// body is large enough that compression saves bytes, matching how eMule servers
+// compress big replies such as search results and source lists. Returns raw
+// unchanged when packing is not applicable or not beneficial. eMule/aMule clients
+// transparently inflate OP_PACKEDPROT server packets.
+func maybePackFrame(raw []byte) []byte {
+	if len(raw) <= protocol.PacketHeaderSize || raw[0] != protocol.EdonkeyHeader {
+		return raw
+	}
+	body := raw[protocol.PacketHeaderSize:]
+	if len(body) < minPackBodyBytes {
+		return raw
+	}
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(body); err != nil {
+		return raw
+	}
+	if err := zw.Close(); err != nil {
+		return raw
+	}
+	compressed := buf.Bytes()
+	if len(compressed) >= len(body) {
+		return raw
+	}
+	out := make([]byte, protocol.PacketHeaderSize+len(compressed))
+	out[0] = protocol.PackedProt
+	binary.LittleEndian.PutUint32(out[1:5], uint32(len(compressed)+1))
+	out[5] = raw[5] // opcode is preserved across packing
+	copy(out[protocol.PacketHeaderSize:], compressed)
+	return out
+}
 
 const (
 	ctServerFlags                 byte   = 0x20
@@ -44,6 +88,18 @@ type ServerStats struct {
 	FilesRegistered     int64     `json:"files_registered"`
 	FilesRemoved        int64     `json:"files_removed"`
 	PersistWrites       int64     `json:"persist_writes"`
+	UDPSearchRequests   int64     `json:"udp_search_requests"`
+	UDPSourceRequests   int64     `json:"udp_source_requests"`
+	UDPDropped          int64     `json:"udp_dropped"`
+	UDPMalformed        int64     `json:"udp_malformed"`
+	UDPRateLimited      int64     `json:"udp_rate_limited"`
+	ConnRateLimited     int64     `json:"conn_rate_limited"`
+	OfferFilesDropped   int64     `json:"offer_files_dropped"`
+	CallbackRateLimited int64     `json:"callback_rate_limited"`
+	PeerStatusReplies   int64     `json:"peer_status_replies"`
+	PeersLearned        int64     `json:"peers_learned"`
+	HTTPProbes          int64     `json:"http_probes"`
+	Peers               int       `json:"peers"`
 }
 
 // ClientSnapshot is the admin-facing view of a connected client.
@@ -71,17 +127,24 @@ type Server struct {
 	logger   *slog.Logger
 	combiner protocol.PacketCombiner
 
-	mu            sync.RWMutex
-	listener      net.Listener
-	udpConn       *net.UDPConn
-	adminListener net.Listener
-	clients       map[int32]*clientSession
-	dynamicFiles  map[string]*dynamicSharedFile
-	auditLog      []AuditEntry
-	closed        chan struct{}
-	nextID        int32
-	startedAt     time.Time
-	stats         serverCounters
+	tracer          *packetTracer
+	connLimiter     *udpLimiter // per-IP new-TCP-connection rate limiter; nil when disabled
+	callbackLimiter *udpLimiter // per-IP callback rate limiter (TCP+UDP); nil when disabled
+	peers           *peerRegistry
+
+	mu             sync.RWMutex
+	listener       net.Listener
+	udpConn        *net.UDPConn
+	udpSearchQueue chan udpSearchJob
+	udpLimiter     *udpLimiter
+	adminListener  net.Listener
+	clients        map[int32]*clientSession
+	dynamicFiles   map[string]*dynamicSharedFile
+	auditLog       []AuditEntry
+	closed         chan struct{}
+	nextID         int32
+	startedAt      time.Time
+	stats          serverCounters
 }
 
 type dynamicSharedFile struct {
@@ -105,6 +168,17 @@ type serverCounters struct {
 	FilesRegistered     int64
 	FilesRemoved        int64
 	PersistWrites       int64
+	UDPSearchRequests   int64
+	UDPSourceRequests   int64
+	UDPDropped          int64
+	UDPMalformed        int64
+	UDPRateLimited      int64
+	ConnRateLimited     int64
+	OfferFilesDropped   int64
+	CallbackRateLimited int64
+	PeerStatusReplies   int64
+	PeersLearned        int64
+	HTTPProbes          int64
 }
 
 type clientSession struct {
@@ -149,16 +223,32 @@ func NewServer(cfg Config, catalog *Catalog, logger *slog.Logger) (*Server, erro
 	if logger == nil {
 		logger = slog.Default()
 	}
+	tracer, err := newPacketTracer(normalized, logger)
+	if err != nil {
+		return nil, err
+	}
+	var connLimiter *udpLimiter
+	if normalized.MaxConnsPerIPPerSecond > 0 {
+		connLimiter = newUDPLimiter(normalized.MaxConnsPerIPPerSecond)
+	}
+	var callbackLimiter *udpLimiter
+	if normalized.MaxCallbacksPerIPPerSecond > 0 {
+		callbackLimiter = newUDPLimiter(normalized.MaxCallbacksPerIPPerSecond)
+	}
 	return &Server{
-		cfg:          normalized,
-		catalog:      catalog,
-		logger:       logger,
-		combiner:     serverproto.NewPacketCombiner(),
-		clients:      make(map[int32]*clientSession),
-		dynamicFiles: make(map[string]*dynamicSharedFile),
-		closed:       make(chan struct{}),
-		nextID:       16777217,
-		startedAt:    time.Now(),
+		cfg:             normalized,
+		catalog:         catalog,
+		logger:          logger,
+		tracer:          tracer,
+		connLimiter:     connLimiter,
+		callbackLimiter: callbackLimiter,
+		peers:           newPeerRegistry(normalized.PeerServers),
+		combiner:        serverproto.NewPacketCombiner(),
+		clients:         make(map[int32]*clientSession),
+		dynamicFiles:    make(map[string]*dynamicSharedFile),
+		closed:          make(chan struct{}),
+		nextID:          16777217,
+		startedAt:       time.Now(),
 	}, nil
 }
 
@@ -242,6 +332,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.catalog != nil {
 		_ = s.catalog.Close()
 	}
+	s.tracer.close()
 	for _, client := range clients {
 		_ = client.conn.Close()
 	}
@@ -277,6 +368,18 @@ func (s *Server) StatsSnapshot() ServerStats {
 		FilesRegistered:     s.stats.FilesRegistered,
 		FilesRemoved:        s.stats.FilesRemoved,
 		PersistWrites:       s.stats.PersistWrites,
+		UDPSearchRequests:   s.stats.UDPSearchRequests,
+		UDPSourceRequests:   s.stats.UDPSourceRequests,
+		UDPDropped:          s.stats.UDPDropped,
+		UDPMalformed:        s.stats.UDPMalformed,
+		UDPRateLimited:      s.stats.UDPRateLimited,
+		ConnRateLimited:     s.stats.ConnRateLimited,
+		OfferFilesDropped:   s.stats.OfferFilesDropped,
+		CallbackRateLimited: s.stats.CallbackRateLimited,
+		PeerStatusReplies:   s.stats.PeerStatusReplies,
+		PeersLearned:        s.stats.PeersLearned,
+		HTTPProbes:          s.stats.HTTPProbes,
+		Peers:               s.peers.len(),
 	}
 	s.mu.RUnlock()
 	return stats
@@ -368,6 +471,17 @@ func (s *Server) PersistCatalog() error {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
+	if s.connLimiter != nil {
+		host := conn.RemoteAddr().String()
+		if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			host = tcpAddr.IP.String()
+		}
+		if !s.connLimiter.allow(host) {
+			s.bumpCounter(func(stats *serverCounters) { stats.ConnRateLimited++ })
+			_ = conn.Close()
+			return
+		}
+	}
 	first := make([]byte, 1)
 	if _, err := io.ReadFull(conn, first); err != nil {
 		_ = conn.Close()
@@ -383,7 +497,14 @@ func (s *Server) handleConn(conn net.Conn) {
 		conn = c2
 	} else {
 		if !isPlainEd2kFirstByte(first[0]) {
-			s.logger.Warn("rejected non-ed2k first byte (protocol_obfuscation is false)", "remote", conn.RemoteAddr().String())
+			if isHTTPMethodStart(first[0]) {
+				// Answer browser/port-scanner HTTP probes with an HTTP error instead
+				// of a confusing ED2K parse failure.
+				s.bumpCounter(func(stats *serverCounters) { stats.HTTPProbes++ })
+				_, _ = conn.Write([]byte("HTTP/1.0 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
+			} else {
+				s.logger.Warn("rejected non-ed2k first byte (protocol_obfuscation is false)", "remote", conn.RemoteAddr().String())
+			}
 			_ = conn.Close()
 			return
 		}
@@ -421,6 +542,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			stats.InboundPackets++
 			stats.InboundBytes += int64(frameBytes)
 		})
+		s.tracer.record(traceIn, "tcp", conn.RemoteAddr().String(), header.Protocol, header.Packet, frameBytes, body)
 		if header.Protocol != protocol.EdonkeyHeader {
 			s.logger.Warn("unsupported protocol", "protocol", header.Protocol, "remote", conn.RemoteAddr().String())
 			return
@@ -519,10 +641,53 @@ func (s *Server) handleGetServerList(client *clientSession) error {
 	if err := client.send("server.Status", &serverproto.Status{UsersCount: int32(s.clientCount()), FilesCount: int32(s.currentFilesCount())}); err != nil {
 		return err
 	}
-	if s.cfg.ServerDescription == "" {
+	if s.cfg.ServerDescription != "" {
+		if err := client.send("server.Message", &serverproto.Message{Value: protocol.ByteContainer16FromString(s.cfg.ServerDescription)}); err != nil {
+			return err
+		}
+	}
+	// Reply with an OP_SERVERLIST carrying this server's own endpoint, the
+	// address the client reached us on, so clients (e.g. aMule) that request the
+	// list on connect get a well-formed answer instead of nothing.
+	if localTCP, ok := client.conn.LocalAddr().(*net.TCPAddr); ok {
+		if body := buildServerListBody(localTCP.IP, s.serverTCPPort(), s.cfg.PeerServers); body != nil {
+			return client.sendRawEd2k(opServerList, body)
+		}
+	}
+	return nil
+}
+
+// buildServerListBody encodes an OP_SERVERLIST payload: a 1-byte server count
+// followed by that many (4-byte IPv4 + little-endian uint16 port) entries. The
+// first entry is this server (the address the client reached us on); peers are
+// the configured "ip:port" peer servers. Returns nil if no valid entry exists.
+func buildServerListBody(self net.IP, selfPort uint16, peers []string) []byte {
+	body := make([]byte, 0, 1+(1+len(peers))*6)
+	count := 0
+	appendEntry := func(v4 net.IP, port uint16) {
+		body = append(body, v4[0], v4[1], v4[2], v4[3])
+		body = append(body, byte(port), byte(port>>8))
+		count++
+	}
+	if v4 := self.To4(); v4 != nil {
+		appendEntry(v4, selfPort)
+	}
+	for _, peer := range peers {
+		host, portStr, err := net.SplitHostPort(strings.TrimSpace(peer))
+		if err != nil {
+			continue
+		}
+		v4 := net.ParseIP(host).To4()
+		port, perr := strconv.Atoi(portStr)
+		if v4 == nil || perr != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		appendEntry(v4, uint16(port))
+	}
+	if count == 0 {
 		return nil
 	}
-	return client.send("server.Message", &serverproto.Message{Value: protocol.ByteContainer16FromString(s.cfg.ServerDescription)})
+	return append([]byte{byte(count)}, body...)
 }
 
 func (s *Server) handleOfferFiles(client *clientSession, req OfferFiles) error {
@@ -549,6 +714,12 @@ func (s *Server) handleOfferFiles(client *clientSession, req OfferFiles) error {
 		}
 		records = append(records, record)
 	}
+	if capped := capOfferedRecords(records, s.cfg.MaxOfferedFilesPerClient); len(capped) < len(records) {
+		s.bumpCounter(func(stats *serverCounters) {
+			stats.OfferFilesDropped += int64(len(records) - len(capped))
+		})
+		records = capped
+	}
 	s.replaceClientOfferedFiles(clientID, records)
 	s.bumpCounter(func(stats *serverCounters) {
 		stats.FilesRegistered += int64(len(records))
@@ -556,8 +727,27 @@ func (s *Server) handleOfferFiles(client *clientSession, req OfferFiles) error {
 	return client.send("server.Status", &serverproto.Status{UsersCount: int32(s.clientCount()), FilesCount: int32(s.currentFilesCount())})
 }
 
+// capSearchResults limits a result set to max entries; max <= 0 means unlimited.
+func capSearchResults(results []serverproto.SharedFileEntry, max int) []serverproto.SharedFileEntry {
+	if max > 0 && len(results) > max {
+		return results[:max]
+	}
+	return results
+}
+
+// loggedIn reports whether the client has completed OP_LOGINREQUEST (has an ID).
+func (c *clientSession) loggedIn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.assignedID != 0
+}
+
 func (s *Server) handleSearch(client *clientSession, query SearchQuery) error {
-	results := s.searchAll(query)
+	if !client.loggedIn() {
+		// Ignore pre-login searches (return an empty result, do not disconnect).
+		return client.send("server.SearchResult", &serverproto.SearchResult{Results: nil, MoreResults: false})
+	}
+	results := capSearchResults(s.searchAll(query), s.cfg.MaxTCPSearchResults)
 	client.noteSearchRequest()
 	s.bumpCounter(func(stats *serverCounters) {
 		stats.SearchRequests++
@@ -596,10 +786,7 @@ func (s *Server) handleSearchMore(client *clientSession) error {
 }
 
 func (s *Server) handleGetSources(client *clientSession, req serverproto.GetFileSources, obfuscatedReply bool) error {
-	sources := s.sourcesAll(req.Hash, obfuscatedReply)
-	if len(sources) > 255 {
-		sources = sources[:255]
-	}
+	sources := orderAndCapSources(s.sourcesAll(req.Hash, obfuscatedReply), s.cfg.MaxSourcesPerReply)
 	client.noteSourceRequest()
 	s.bumpCounter(func(stats *serverCounters) {
 		stats.SourceRequests++
@@ -615,6 +802,16 @@ func (s *Server) handleGetSources(client *clientSession, req serverproto.GetFile
 }
 
 func (s *Server) handleCallback(client *clientSession, req serverproto.CallbackRequest) error {
+	if s.callbackLimiter != nil {
+		ip := ""
+		if client.remote != nil {
+			ip = client.remote.IP.String()
+		}
+		if !s.callbackLimiter.allow(ip) {
+			s.bumpCounter(func(stats *serverCounters) { stats.CallbackRateLimited++ })
+			return client.send("server.CallbackRequestFailed", &serverproto.CallbackRequestFailed{})
+		}
+	}
 	client.noteCallbackRequest()
 	s.bumpCounter(func(stats *serverCounters) {
 		stats.CallbackRequests++
@@ -738,6 +935,48 @@ type foundSourceEntry struct {
 	Port               int
 	ObfuscationOptions uint8
 	UserHash           *protocol.Hash
+}
+
+// capOfferedRecords truncates a client's published file list to max entries.
+// A max <= 0 means unlimited (the cap is disabled).
+func capOfferedRecords(records []FileRecord, max int) []FileRecord {
+	if max > 0 && len(records) > max {
+		return records[:max]
+	}
+	return records
+}
+
+// orderAndCapSources orders found sources HighID-first (routable client IDs
+// before LowID) so clients receive directly-reachable peers first, then caps the
+// list. A max <= 0 or > 255 falls back to the ED2K protocol limit of 255.
+func orderAndCapSources(sources []foundSourceEntry, max int) []foundSourceEntry {
+	if max <= 0 || max > 255 {
+		max = 255
+	}
+	// Drop duplicate endpoints (same client ID + port) so a file offered by the
+	// same peer through several paths is not returned multiple times.
+	if len(sources) > 1 {
+		seen := make(map[[2]int64]struct{}, len(sources))
+		deduped := make([]foundSourceEntry, 0, len(sources))
+		for _, src := range sources {
+			key := [2]int64{int64(src.ClientID), int64(src.Port)}
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			deduped = append(deduped, src)
+		}
+		sources = deduped
+	}
+	sort.SliceStable(sources, func(i, j int) bool {
+		hi := uint32(sources[i].ClientID) >= 0x1000000
+		hj := uint32(sources[j].ClientID) >= 0x1000000
+		return hi && !hj
+	})
+	if len(sources) > max {
+		sources = sources[:max]
+	}
+	return sources
 }
 
 func (s *Server) sourcesAll(hash protocol.Hash, obfuscated bool) []foundSourceEntry {
@@ -971,12 +1210,17 @@ func (c *clientSession) sendLocked(typeName string, packet protocol.Serializable
 	if err != nil {
 		return err
 	}
-	c.noteOutbound(len(raw))
+	// Trace the logical frame before optional on-the-wire compression.
+	if len(raw) >= 6 {
+		c.server.tracer.record(traceOut, "tcp", c.conn.RemoteAddr().String(), raw[0], raw[5], len(raw), raw[6:])
+	}
+	wire := maybePackFrame(raw)
+	c.noteOutbound(len(wire))
 	c.server.bumpCounter(func(stats *serverCounters) {
 		stats.OutboundPackets++
-		stats.OutboundBytes += int64(len(raw))
+		stats.OutboundBytes += int64(len(wire))
 	})
-	_, err = c.conn.Write(raw)
+	_, err = c.conn.Write(wire)
 	return err
 }
 
@@ -1026,6 +1270,7 @@ func (c *clientSession) sendRawEd2k(opcode byte, body []byte) error {
 		stats.OutboundPackets++
 		stats.OutboundBytes += int64(len(raw))
 	})
+	c.server.tracer.record(traceOut, "tcp", c.conn.RemoteAddr().String(), protocol.EdonkeyHeader, opcode, len(raw), body)
 	_, err := c.conn.Write(raw)
 	return err
 }
@@ -1113,7 +1358,36 @@ func readFrame(conn net.Conn) (protocol.PacketHeader, []byte, int, error) {
 	if _, err := io.ReadFull(conn, body); err != nil {
 		return protocol.PacketHeader{}, nil, 0, err
 	}
-	return header, body, protocol.PacketHeaderSize + bodySize, nil
+	frameBytes := protocol.PacketHeaderSize + bodySize
+	// Packed (zlib) frames carry a compressed payload after the opcode; inflate it
+	// and present the frame to the dispatcher as a normal ED2K packet.
+	if header.Protocol == protocol.PackedProt {
+		inflated, err := inflatePackedFrame(body)
+		if err != nil {
+			return protocol.PacketHeader{}, nil, 0, fmt.Errorf("packed frame: %w", err)
+		}
+		header.Protocol = protocol.EdonkeyHeader
+		body = inflated
+	}
+	return header, body, frameBytes, nil
+}
+
+// inflatePackedFrame zlib-decompresses a packed ED2K frame body with a hard cap
+// on the decoded size.
+func inflatePackedFrame(body []byte) ([]byte, error) {
+	zr, err := zlib.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(io.LimitReader(zr, maxDecodedFrameBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxDecodedFrameBytes {
+		return nil, fmt.Errorf("decompressed frame exceeds %d bytes", maxDecodedFrameBytes)
+	}
+	return out, nil
 }
 
 func extractClientName(tags protocol.TagList) string {
@@ -1168,6 +1442,16 @@ func parseSourceUserHash(value string) (protocol.Hash, bool) {
 		return protocol.Hash{}, false
 	}
 	return hash, true
+}
+
+// isHTTPMethodStart reports whether b is the first byte of a common HTTP request
+// method, used to detect and politely reject HTTP probes on the ED2K port.
+func isHTTPMethodStart(b byte) bool {
+	switch b {
+	case 'G', 'P', 'H', 'O', 'D', 'T', 'C': // GET, POST/PUT, HEAD, OPTIONS, DELETE, TRACE, CONNECT
+		return true
+	}
+	return false
 }
 
 func clientIDFromRemote(addr *net.TCPAddr) int32 {
