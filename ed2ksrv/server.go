@@ -714,15 +714,10 @@ func (s *Server) handleOfferFiles(client *clientSession, req OfferFiles) error {
 		}
 		records = append(records, record)
 	}
-	if capped := capOfferedRecords(records, s.cfg.MaxOfferedFilesPerClient); len(capped) < len(records) {
-		s.bumpCounter(func(stats *serverCounters) {
-			stats.OfferFilesDropped += int64(len(records) - len(capped))
-		})
-		records = capped
-	}
-	s.replaceClientOfferedFiles(clientID, records)
+	accepted, dropped := s.mergeClientOfferedFiles(clientID, records)
 	s.bumpCounter(func(stats *serverCounters) {
-		stats.FilesRegistered += int64(len(records))
+		stats.FilesRegistered += int64(accepted)
+		stats.OfferFilesDropped += int64(dropped)
 	})
 	return client.send("server.Status", &serverproto.Status{UsersCount: int32(s.clientCount()), FilesCount: int32(s.currentFilesCount())})
 }
@@ -1024,19 +1019,34 @@ func (s *Server) sourcesAll(hash protocol.Hash, obfuscated bool) []foundSourceEn
 	return sources
 }
 
-func (s *Server) replaceClientOfferedFiles(clientID int32, records []FileRecord) {
+// eMule sends OP_OFFERFILES in incremental batches as files finish hashing.
+// Preserve earlier batches until the client disconnects; an empty offer clears
+// the set. Enforce the per-client cap across all batches, not per packet.
+func (s *Server) mergeClientOfferedFiles(clientID int32, records []FileRecord) (int, int) {
 	client := s.findClient(clientID)
 	if client == nil {
-		return
+		return 0, 0
+	}
+	if len(records) == 0 {
+		s.removeClientOfferedFiles(clientID)
+		return 0, 0
 	}
 	client.mu.Lock()
-	previous := make([]FileRecord, 0, len(client.offeredFiles))
-	for _, record := range client.offeredFiles {
-		previous = append(previous, record)
-	}
-	client.offeredFiles = make(map[string]FileRecord, len(records))
+	previous := make([]FileRecord, 0, len(records))
+	accepted := make([]FileRecord, 0, len(records))
+	dropped := 0
 	for _, record := range records {
-		client.offeredFiles[record.Hash.String()] = record
+		key := record.Hash.String()
+		old, exists := client.offeredFiles[key]
+		if !exists && s.cfg.MaxOfferedFilesPerClient > 0 && len(client.offeredFiles) >= s.cfg.MaxOfferedFilesPerClient {
+			dropped++
+			continue
+		}
+		if exists {
+			previous = append(previous, old)
+		}
+		client.offeredFiles[key] = record
+		accepted = append(accepted, record)
 	}
 	client.mu.Unlock()
 
@@ -1045,9 +1055,10 @@ func (s *Server) replaceClientOfferedFiles(clientID int32, records []FileRecord)
 	for _, record := range previous {
 		s.removeDynamicLocked(clientID, record.Hash)
 	}
-	for _, record := range records {
+	for _, record := range accepted {
 		s.addDynamicLocked(clientID, record)
 	}
+	return len(accepted), dropped
 }
 
 func (s *Server) removeClientOfferedFiles(clientID int32) {

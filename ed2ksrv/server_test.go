@@ -433,6 +433,32 @@ func TestOfferFilesRegistersDynamicSharedEntries(t *testing.T) {
 	if offeredRecord.Endpoints[0].Host != expectedSourceHost || offeredRecord.Endpoints[0].Port != 4662 {
 		t.Fatalf("unexpected dynamic endpoint from offered file: %+v", offeredRecord.Endpoints[0])
 	}
+	secondHash := protocol.MustHashFromString("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+	secondBatch := OfferFiles{Entries: []serverproto.SharedFileEntry{{
+		Hash: secondHash,
+		Port: 4662,
+		Tags: protocol.TagList{
+			protocol.NewStringTag(protocol.FTFilename, "later-hashed-file.pdf"),
+			protocol.NewUInt32Tag(protocol.FTFileSize, 2048),
+		},
+	}}}
+	if err := writeCustomPacket(conn, opOfferFiles, &secondBatch); err != nil {
+		t.Fatalf("write incremental offer: %v", err)
+	}
+	packet, err = readPacket(conn, &combiner)
+	if err != nil {
+		t.Fatalf("read incremental offer status: %v", err)
+	}
+	status, ok = packet.(*serverproto.Status)
+	if !ok || status.FilesCount != 5 {
+		t.Fatalf("incremental offer replaced the previous file: %T %+v", packet, status)
+	}
+	if _, ok := server.FileSnapshot(offered.Entries[0].Hash); !ok {
+		t.Fatal("first offer disappeared after an incremental batch")
+	}
+	if _, ok := server.FileSnapshot(secondHash); !ok {
+		t.Fatal("second offer was not registered")
+	}
 
 	search := serverproto.SearchRequest{Query: "shared runtime", FileType: "Video", Extension: "mkv"}
 	if err := writePacket(conn, combiner, "server.SearchRequest", &search); err != nil {
