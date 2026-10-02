@@ -2,6 +2,11 @@
 
 `github.com/chenjia404/goed2k-server` is an ED2K/eMule server implemented in Go, compatible with the `github.com/monkeyWie/goed2k` client protocol.
 
+> **eMuleBB fork role:** `emulebb/goed2k-server` is the fixed deterministic
+> server used by local eMuleBB harness scenarios. It is test infrastructure, not
+> an evolving service or product. Change it only when required to keep the
+> maintained harness working.
+
 The current release focuses on two areas:
 
 - ED2K/eMule TCP server protocol

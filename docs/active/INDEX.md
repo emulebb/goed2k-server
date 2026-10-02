@@ -1,22 +1,14 @@
-# goed2k-server Active Backlog — Lab Index
+# goed2k-server Harness Baseline
 
-> **Tier: Lab.** goed2k-server is a **lab/service** product in the BB suite, not a
-> shipped client. By operator decision (2026-06-14) it **stays lab for now**: no
-> build/test CI gate and no org-board itemization yet. This index is a lightweight
-> tracking record of the Lugdunum-parity program; promote to full
-> `docs/active/items` + the eMuleBB Suite board only when goed2k leaves lab tier.
+> **Lifecycle: harness-only.** goed2k-server is the fixed deterministic local
+> eD2K server used by eMuleBB tests. It has no product roadmap, promotion trigger,
+> or feature-evolution program.
 
 Purpose: a deterministic local ED2K server used by eMuleBB/emulebb-rust live E2E
-and protocol-parity scenarios. Active goal: feature-by-feature parity with
-**Lugdunum eserver 17.15**, validated with live clients + the Python campaigns.
+and protocol-parity scenarios. The checklist below records the baseline that was
+assembled for those scenarios; it is provenance, not a forward backlog.
 
-## ID Taxonomy (when promoted)
-
-Item IDs would use the product prefix `GOED2K-<CLASS>-<NNN>` (classes `BUG`,
-`FEAT`, `REF`, `CI`). Until promotion, the parity features below are tracked as a
-checklist, not as individual item files.
-
-## Lugdunum-parity checklist
+## Recorded Lugdunum-parity baseline
 
 Done (live-validated where noted):
 
@@ -36,12 +28,11 @@ Done (live-validated where noted):
 - [x] F15 — Deeper peer-list exchange (`OP_SERVER_LIST_REQ/RES`, learn peers)
 - [x] F16-18 — UDP server-list variant 0xa4; TCP total search-result cap; HTTP-probe reject
 
-Next (suggested order, uncommitted working-tree may exist):
+Parked observations (not scheduled work):
 
 - [ ] Finish session-phase enforcement (`handleGetSources`/`handleCallback` pre-login guard)
 - [ ] Send-side standalone packing polish
 - [ ] Further abuse-control / publish-conflict hardening
 
-Authoritative inputs and the live test loop are recorded in the project memory
-note `goed2k-lugdunum-parity-loop` and in `docs/legacy-ed2k-server/`. KAD stays
-out of goed2k scope.
+Historical inputs are retained in `docs/legacy-ed2k-server/`. Kad stays out of
+goed2k scope.
